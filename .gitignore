@@ -1,0 +1,15 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.db
+*.db-shm
+*.db-wal
+
+## Node
+node_modules/
+dist/
+.env
+.env.local
+.DS_Store

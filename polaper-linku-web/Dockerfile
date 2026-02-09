@@ -1,8 +1,8 @@
 FROM node:20-alpine AS build
 WORKDIR /app
-COPY package*.json ./
+COPY polaper-linku-web/package*.json ./
 RUN npm install
-COPY . .
+COPY polaper-linku-web/ .
 RUN npm run build
 
 FROM nginx:alpine

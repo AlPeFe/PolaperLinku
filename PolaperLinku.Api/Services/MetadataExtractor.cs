@@ -1,5 +1,6 @@
 using HtmlAgilityPack;
 using Microsoft.Playwright;
+using System.Net;
 using System.Text.RegularExpressions;
 
 namespace PolaperLinku.Api.Services;
@@ -34,7 +35,7 @@ public class MetadataExtractor
 
             if (IsXUrl(url))
             {
-                // Para Twitter/X, usar fxtwitter como proxy para obtener metadatos
+                // Para X (Twitter), usar vxtwitter como proxy para obtener metadatos
                 metadata = await ExtractFromFxTwitterAsync(url);
             }
             else
@@ -74,32 +75,233 @@ public class MetadataExtractor
 
     private async Task<(string title, string? description, string? imageUrl)> ExtractFromFxTwitterAsync(string url)
     {
+        // X (Twitter) requiere JavaScript para cargar el contenido
+        // Usar vxtwitter como proxy para obtener metadata sin el mensaje "Redirecting you to the tweet in a moment."
+        (string title, string? description, string? imageUrl) metadata = ("", null, null);
         try
         {
-            // Convertir URL de Twitter/X a fxtwitter para obtener metadatos
-            var fxUrl = url
-                .Replace("twitter.com", "fxtwitter.com")
-                .Replace("x.com", "fxtwitter.com");
+            var vxUrl = url
+                .Replace("twitter.com", "vxtwitter.com")
+                .Replace("x.com", "vxtwitter.com");
 
-            var response = await _httpClient.GetAsync(fxUrl);
+            _logger?.LogInformation("Fetching metadata from vxtwitter: {VxUrl}", vxUrl);
+            
+            var response = await _httpClient.GetAsync(vxUrl);
             if (response.IsSuccessStatusCode)
             {
                 var html = await response.Content.ReadAsStringAsync();
-                var metadata = ExtractFromHtml(html, url);
+                metadata = ExtractFromHtml(html, url);
                 
-                if (!string.IsNullOrEmpty(metadata.imageUrl))
-                {
-                    return metadata;
-                }
+                _logger?.LogInformation("vxtwitter returned - Title: {Title}, HasDescription: {HasDesc}, HasImage: {HasImage}", 
+                    metadata.title, !string.IsNullOrEmpty(metadata.description), !string.IsNullOrEmpty(metadata.imageUrl));
             }
         }
         catch (Exception ex)
         {
-            _logger?.LogWarning(ex, "fxtwitter extraction failed for {Url}", url);
+            _logger?.LogWarning(ex, "vxtwitter extraction failed for {Url}", url);
         }
 
-        // Fallback a Playwright si fxtwitter falla
-        return await ExtractFromPlaywrightAsync(url);
+        // Si tenemos título y descripción de vxtwitter, intentar extraer la imagen con Playwright
+        if (!string.IsNullOrEmpty(metadata.description) ||
+            (!string.IsNullOrEmpty(metadata.title) && 
+             !metadata.title.Equals(GetDomainFromUrl(url), StringComparison.OrdinalIgnoreCase)))
+        {
+            // Si no tenemos imagen, intentar obtenerla con timeout corto
+            if (string.IsNullOrEmpty(metadata.imageUrl))
+            {
+                _logger?.LogInformation("Attempting quick image extraction for {Url}", url);
+                
+                try
+                {
+                    // Intentar obtener la imagen con timeout de 7 segundos
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(7));
+                    var imageTask = ExtractTwitterImageWithPlaywrightAsync(url);
+                    var completedTask = await Task.WhenAny(imageTask, Task.Delay(7000, cts.Token));
+                    
+                    if (completedTask == imageTask)
+                    {
+                        var imageUrl = await imageTask;
+                        if (!string.IsNullOrEmpty(imageUrl))
+                        {
+                            metadata = (metadata.title, metadata.description, imageUrl);
+                            _logger?.LogInformation("Successfully extracted image in time: {ImageUrl}", imageUrl);
+                        }
+                    }
+                    else
+                    {
+                        _logger?.LogInformation("Image extraction timeout, continuing in background");
+                        // Continuar en background sin esperar
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                var bgImageUrl = await imageTask;
+                                if (!string.IsNullOrEmpty(bgImageUrl))
+                                {
+                                    _cache.Set(url, (metadata.title, metadata.description, bgImageUrl));
+                                    _logger?.LogInformation("Background: Image extracted and cached: {ImageUrl}", bgImageUrl);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger?.LogError(ex, "Background image extraction failed");
+                            }
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Quick image extraction failed, skipping");
+                }
+            }
+            return metadata;
+        }
+
+        // Fallback: crear metadata a partir de la URL
+        _logger?.LogInformation("Using enhanced fallback metadata for X/Twitter URL: {Url}", url);
+        return GetEnhancedTwitterFallback(url);
+    }
+
+    private (string title, string? description, string? imageUrl) GetEnhancedTwitterFallback(string url)
+    {
+        var handle = ExtractUserHandleFromUrl(url);
+        var title = !string.IsNullOrEmpty(handle) 
+            ? $"Post by @{handle} on X" 
+            : "Post on X";
+        
+        return (title, "View this post on X (formerly Twitter)", null);
+    }
+
+    private async Task<string?> ExtractTwitterImageWithPlaywrightAsync(string url)
+    {
+        using var playwright = await Playwright.CreateAsync();
+        var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+        {
+            Headless = true,
+            Args = new[] { "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage" }
+        });
+        
+        try
+        {
+            var context = await browser.NewContextAsync(new BrowserNewContextOptions
+            {
+                UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            });
+            
+            var page = await context.NewPageAsync();
+
+            // X nunca alcanza NetworkIdle, usar DOMContentLoaded en su lugar
+            await page.GotoAsync(url, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = 30000
+            });
+
+            // Esperar a que se carguen las imágenes
+            await Task.Delay(3000);
+
+            string? imageUrl = null;
+
+            // Determinar si es un perfil o un tweet
+            if (IsTwitterProfile(url))
+            {
+                // Para perfiles, buscar la imagen del banner
+                _logger?.LogInformation("Extracting profile banner image");
+                
+                // Buscar el banner con varios selectores posibles
+                var bannerSelectors = new[]
+                {
+                    "img[src*='profile_banners']",
+                    "a[href*='header_photo'] img",
+                    "[data-testid='UserProfileHeader_Items'] img[src*='pbs.twimg.com']"
+                };
+
+                foreach (var selector in bannerSelectors)
+                {
+                    try
+                    {
+                        var element = await page.QuerySelectorAsync(selector);
+                        if (element != null)
+                        {
+                            imageUrl = await element.GetAttributeAsync("src");
+                            if (!string.IsNullOrEmpty(imageUrl))
+                            {
+                                _logger?.LogInformation("Found banner image with selector {Selector}: {ImageUrl}", selector, imageUrl);
+                                break;
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Continuar con el siguiente selector
+                    }
+                }
+
+                // Si no hay banner, usar la imagen de perfil
+                if (string.IsNullOrEmpty(imageUrl))
+                {
+                    imageUrl = await ExtractProfileImageAsync(page);
+                }
+            }
+            else
+            {
+                // Para tweets, buscar la imagen de perfil del autor
+                _logger?.LogInformation("Extracting tweet author profile image");
+                imageUrl = await ExtractProfileImageAsync(page);
+            }
+
+            return imageUrl;
+        }
+        catch(Exception ex) 
+        {
+            _logger?.LogError(ex, "Error extracting Twitter image with Playwright for {Url}", url);
+            return null;
+        }
+        finally
+        {
+            await browser.CloseAsync();
+        }
+    }
+
+    private async Task<string?> ExtractProfileImageAsync(IPage page)
+    {
+        var profileImageSelectors = new[]
+        {
+            "img[src*='profile_images']",
+            "[data-testid='UserAvatar-Container'] img",
+            "a[href*='/photo'] img[src*='pbs.twimg.com']"
+        };
+
+        foreach (var selector in profileImageSelectors)
+        {
+            try
+            {
+                var element = await page.QuerySelectorAsync(selector);
+                if (element != null)
+                {
+                    var src = await element.GetAttributeAsync("src");
+                    if (!string.IsNullOrEmpty(src) && src.Contains("profile_images"))
+                    {
+                        // Obtener la versión de mayor calidad (remover _normal, _bigger, etc.)
+                        src = src.Replace("_normal", "_400x400").Replace("_bigger", "_400x400");
+                        _logger?.LogInformation("Found profile image with selector {Selector}: {ImageUrl}", selector, src);
+                        return src;
+                    }
+                }
+            }
+            catch
+            {
+                // Continuar con el siguiente selector
+            }
+        }
+
+        return null;
+    }
+
+    private bool IsTwitterProfile(string url)
+    {
+        // Un perfil de X no contiene /status/ en la URL
+        return !url.Contains("/status/", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<(string title, string? description, string? imageUrl)> ExtractFromHttpClientAsync(string url)
@@ -417,7 +619,7 @@ public class MetadataExtractor
             var handle = ExtractUserHandleFromUrl(url);
             if (!string.IsNullOrEmpty(handle))
             {
-                title = $"@{handle} - X (Twitter)";
+                title = $"@{handle} - X";
             }
         }
 

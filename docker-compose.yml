@@ -8,26 +8,28 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./data:/app/data
+      - ~/.data/polaper-linku:/app/data
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:5000
     networks:
       - polaper-network
+    restart: unless-stopped
 
   web:
     build:
       context: ./polaper-linku-web
       dockerfile: Dockerfile
     ports:
-      - "80:80"
+      - "8080:80"
     depends_on:
       - api
+    environment:
+      - VITE_API_URL=http://localhost:5000
     networks:
       - polaper-network
+    restart: unless-stopped
 
 networks:
   polaper-network:
     driver: bridge
-
-volumes:
-  data:

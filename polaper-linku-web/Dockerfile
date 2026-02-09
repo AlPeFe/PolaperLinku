@@ -3,6 +3,8 @@ WORKDIR /app
 COPY polaper-linku-web/package*.json ./
 RUN npm install
 COPY polaper-linku-web/ .
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=$VITE_API_URL
 RUN npm run build
 
 FROM nginx:alpine

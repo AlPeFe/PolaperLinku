@@ -16,9 +16,8 @@ services:
     build:
       context: .
       dockerfile: ./polaper-linku-web/Dockerfile
-    environment:
-      # Apunta a la API usando el hostname del servicio dentro de Docker
-      - VITE_API_URL=http://api:5000
+      args:
+        - VITE_API_URL=/api
     networks:
       - polaper-network
     restart: unless-stopped

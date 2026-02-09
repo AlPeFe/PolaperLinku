@@ -1,12 +1,10 @@
+version: "3.9"
+
 services:
   api:
     build:
       context: .
       dockerfile: ./PolaperLinku.Api/Dockerfile
-    ports:
-      - "5000:5000"
-    volumes:
-      - ~/.data/polaper-linku:/app/data
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:5000
@@ -18,12 +16,23 @@ services:
     build:
       context: .
       dockerfile: ./polaper-linku-web/Dockerfile
-    ports:
-      - "8080:80"
-    depends_on:
-      - api
     environment:
-      - VITE_API_URL=http://localhost:5000
+      # Apunta a la API usando el hostname del servicio dentro de Docker
+      - VITE_API_URL=http://api:5000
+    networks:
+      - polaper-network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:stable
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - web
+      - api
     networks:
       - polaper-network
     restart: unless-stopped

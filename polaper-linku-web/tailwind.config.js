@@ -8,7 +8,10 @@ export default {
     extend: {
       fontSize: {
         'xxs': '0.65rem',
-      }
+      },
+      fontFamily: {
+        sans: ['Noto Sans', 'sans-serif'],
+      },
     },
   },
   plugins: [],

@@ -1,6 +1,5 @@
 using HtmlAgilityPack;
 using Microsoft.Playwright;
-using System.Net;
 using System.Text.RegularExpressions;
 
 namespace PolaperLinku.Api.Services;
@@ -9,13 +8,17 @@ public class MetadataExtractor
 {
     private readonly HttpClient _httpClient;
     private readonly MetadataCache _cache;
+    private readonly ILogger<MetadataExtractor>? _logger;
 
-    public MetadataExtractor(HttpClient httpClient, MetadataCache cache)
+    public MetadataExtractor(HttpClient httpClient, MetadataCache cache, ILogger<MetadataExtractor>? logger = null)
     {
         _httpClient = httpClient;
         _cache = cache;
-        _httpClient.Timeout = TimeSpan.FromSeconds(10);
+        _logger = logger;
+        _httpClient.Timeout = TimeSpan.FromSeconds(15);
         _httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        _httpClient.DefaultRequestHeaders.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
+        _httpClient.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.5");
     }
 
     public async Task<(string title, string? description, string? imageUrl)> ExtractMetadataAsync(string url)
@@ -31,34 +34,93 @@ public class MetadataExtractor
 
             if (IsXUrl(url))
             {
-                metadata = await ExtractFromPlaywrightAsync(url);
+                // Para Twitter/X, usar fxtwitter como proxy para obtener metadatos
+                metadata = await ExtractFromFxTwitterAsync(url);
             }
             else
             {
+                // Primero intentar con HttpClient
                 metadata = await ExtractFromHttpClientAsync(url);
+                
+                // Si no obtuvimos imagen, intentar con Playwright como fallback
+                if (string.IsNullOrEmpty(metadata.imageUrl))
+                {
+                    try
+                    {
+                        var playwrightMetadata = await ExtractFromPlaywrightAsync(url);
+                        if (!string.IsNullOrEmpty(playwrightMetadata.imageUrl))
+                        {
+                            metadata = playwrightMetadata;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogWarning(ex, "Playwright fallback failed for {Url}", url);
+                    }
+                }
             }
 
             _cache.Set(url, metadata);
             return metadata;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger?.LogError(ex, "Error extracting metadata for {Url}", url);
             var fallback = GetFallbackMetadata(url);
             _cache.Set(url, fallback);
             return fallback;
         }
     }
 
-    private async Task<(string title, string? description, string? imageUrl)> ExtractFromHttpClientAsync(string url)
+    private async Task<(string title, string? description, string? imageUrl)> ExtractFromFxTwitterAsync(string url)
     {
-        var response = await _httpClient.GetAsync(url);
-        if (!response.IsSuccessStatusCode)
+        try
         {
-            return GetFallbackMetadata(url);
+            // Convertir URL de Twitter/X a fxtwitter para obtener metadatos
+            var fxUrl = url
+                .Replace("twitter.com", "fxtwitter.com")
+                .Replace("x.com", "fxtwitter.com");
+
+            var response = await _httpClient.GetAsync(fxUrl);
+            if (response.IsSuccessStatusCode)
+            {
+                var html = await response.Content.ReadAsStringAsync();
+                var metadata = ExtractFromHtml(html, url);
+                
+                if (!string.IsNullOrEmpty(metadata.imageUrl))
+                {
+                    return metadata;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "fxtwitter extraction failed for {Url}", url);
         }
 
-        var html = await response.Content.ReadAsStringAsync();
-        return ExtractFromHtml(html, url);
+        // Fallback a Playwright si fxtwitter falla
+        return await ExtractFromPlaywrightAsync(url);
+    }
+
+    private async Task<(string title, string? description, string? imageUrl)> ExtractFromHttpClientAsync(string url)
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger?.LogWarning("HTTP request failed with status {StatusCode} for {Url}", response.StatusCode, url);
+                return GetFallbackMetadata(url);
+            }
+
+            var html = await response.Content.ReadAsStringAsync();
+            return ExtractFromHtml(html, url);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "HttpClient extraction failed for {Url}", url);
+            return GetFallbackMetadata(url);
+        }
     }
 
     private async Task<(string title, string? description, string? imageUrl)> ExtractFromPlaywrightAsync(string url)
@@ -66,20 +128,27 @@ public class MetadataExtractor
         using var playwright = await Playwright.CreateAsync();
         var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
         {
-            Headless = true
+            Headless = true,
+            Args = new[] { "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage" }
         });
         
         try
         {
-            var page = await browser.NewPageAsync();
+            var context = await browser.NewContextAsync(new BrowserNewContextOptions
+            {
+                UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            });
+            
+            var page = await context.NewPageAsync();
 
             await page.GotoAsync(url, new PageGotoOptions
             {
-                WaitUntil = WaitUntilState.DOMContentLoaded,
-                Timeout = 15000
+                WaitUntil = WaitUntilState.NetworkIdle,
+                Timeout = 20000
             });
 
-            await Task.Delay(2000);
+            // Esperar un poco más para sitios SPA
+            await Task.Delay(1500);
 
             var html = await page.ContentAsync();
 
@@ -89,7 +158,8 @@ public class MetadataExtractor
             var title = GetMetaContent(doc, "og:title")
                 ?? GetMetaContent(doc, "twitter:title")
                 ?? GetTitleFromHtml(doc)
-                ?? ExtractXTitleFromPlaywright(doc, url);
+                ?? ExtractXTitleFromPlaywright(doc, url)
+                ?? GetDomainFromUrl(url);
 
             var description = GetMetaContent(doc, "og:description")
                 ?? GetMetaContent(doc, "twitter:description")
@@ -97,9 +167,16 @@ public class MetadataExtractor
                 ?? ExtractXDescriptionFromPlaywright(doc, url);
 
             var imageUrl = GetMetaContent(doc, "og:image")
-                ?? GetMetaContent(doc, "twitter:image");
+                ?? GetMetaContent(doc, "twitter:image")
+                ?? GetMetaContent(doc, "twitter:image:src");
 
-            return (title, description, imageUrl);
+            // Hacer URL absoluta si es relativa
+            if (!string.IsNullOrEmpty(imageUrl))
+            {
+                imageUrl = MakeAbsoluteUrl(imageUrl, url);
+            }
+
+            return (CleanText(title), description != null ? CleanText(description) : null, imageUrl);
         }
         finally
         {
@@ -109,6 +186,8 @@ public class MetadataExtractor
 
     private string? ExtractXTitleFromPlaywright(HtmlDocument doc, string url)
     {
+        if (!IsXUrl(url)) return null;
+        
         var handle = ExtractUserHandleFromUrl(url);
         if (!string.IsNullOrEmpty(handle))
         {
@@ -167,7 +246,6 @@ public class MetadataExtractor
             ?? GetMetaContent(doc, "twitter:title")
             ?? GetMetaContent(doc, "title")
             ?? GetTitleFromHtml(doc)
-            ?? ExtractXTitle(doc, url)
             ?? GetDomainFromUrl(url);
         
         return CleanText(title);
@@ -178,7 +256,6 @@ public class MetadataExtractor
         var description = GetMetaContent(doc, "og:description")
             ?? GetMetaContent(doc, "twitter:description")
             ?? GetMetaContent(doc, "description")
-            ?? ExtractXDescription(doc, url)
             ?? ExtractFirstParagraph(doc);
         
         return description != null ? CleanText(description) : null;
@@ -188,57 +265,30 @@ public class MetadataExtractor
     {
         var imageUrl = GetMetaContent(doc, "og:image")
             ?? GetMetaContent(doc, "twitter:image")
-            ?? GetMetaContent(doc, "twitter:image:src");
+            ?? GetMetaContent(doc, "twitter:image:src")
+            ?? GetFirstImage(doc);
         
         return imageUrl != null ? MakeAbsoluteUrl(imageUrl, url) : null;
     }
 
-    private string? ExtractXTitle(HtmlDocument doc, string url)
+    private string? GetFirstImage(HtmlDocument doc)
     {
-        if (!IsXUrl(url)) return null;
-
-        var twitterTitle = GetMetaContent(doc, "twitter:title");
-        if (!string.IsNullOrEmpty(twitterTitle)) return twitterTitle;
-
-        var titleNode = doc.DocumentNode.SelectSingleNode("//h1[@data-testid='UserDescription']");
-        if (titleNode != null) return titleNode.InnerText?.Trim();
-
-        var userHandle = ExtractUserHandleFromUrl(url);
-        if (!string.IsNullOrEmpty(userHandle))
+        // Buscar una imagen principal (hero, banner, etc.)
+        var imgNode = doc.DocumentNode.SelectSingleNode("//img[@class[contains(., 'hero')]]")
+            ?? doc.DocumentNode.SelectSingleNode("//img[@class[contains(., 'banner')]]")
+            ?? doc.DocumentNode.SelectSingleNode("//img[@class[contains(., 'logo')]]")
+            ?? doc.DocumentNode.SelectSingleNode("//main//img")
+            ?? doc.DocumentNode.SelectSingleNode("//article//img");
+        
+        var src = imgNode?.GetAttributeValue("src", null);
+        
+        // Solo devolver si es una URL válida (no data URI o placeholder)
+        if (!string.IsNullOrEmpty(src) && !src.StartsWith("data:") && src.Length > 10)
         {
-            var bioNode = doc.DocumentNode.SelectSingleNode($"//div[@data-testid='UserDescription']");
-            var userNameNode = doc.DocumentNode.SelectSingleNode("//div[@data-testid='UserName']");
-            var handle = userNameNode?.InnerText?.Trim();
-            var bio = bioNode?.InnerText?.Trim();
-            
-            if (!string.IsNullOrEmpty(handle))
-            {
-                return $"@{handle} - {bio ?? ""}";
-            }
+            return src;
         }
-
-        return GetTitleFromHtml(doc);
-    }
-
-    private string? ExtractXDescription(HtmlDocument doc, string url)
-    {
-        if (!IsXUrl(url)) return null;
-
-        var twitterDesc = GetMetaContent(doc, "twitter:description");
-        if (!string.IsNullOrEmpty(twitterDesc)) return twitterDesc;
-
-        var tweetNode = doc.DocumentNode.SelectSingleNode("//div[@data-testid='tweet']");
-        if (tweetNode != null)
-        {
-            var textNode = tweetNode.SelectSingleNode(".//div[@data-testid='tweetText']");
-            if (textNode != null)
-            {
-                var text = textNode.InnerText?.Trim();
-                return !string.IsNullOrEmpty(text) ? TruncateText(text, 200) : null;
-            }
-        }
-
-        return ExtractUserDescription(doc);
+        
+        return null;
     }
 
     private string? ExtractUserDescription(HtmlDocument doc)
@@ -323,7 +373,7 @@ public class MetadataExtractor
     {
         if (string.IsNullOrEmpty(url)) return null;
         
-        if (Uri.TryCreate(url, UriKind.Absolute, out var absoluteUri))
+        if (Uri.TryCreate(url, UriKind.Absolute, out _))
         {
             return url;
         }
@@ -343,9 +393,7 @@ public class MetadataExtractor
         if (string.IsNullOrEmpty(text)) return text;
         
         var cleaned = Regex.Replace(text, @"\s+", " ").Trim();
-        cleaned = Regex.Replace(cleaned, @"\n+", " ");
-        cleaned = cleaned.Replace("\r", "");
-        cleaned = cleaned.Replace("\t", " ");
+        cleaned = WebUtility.HtmlDecode(cleaned);
         
         return cleaned;
     }
@@ -355,7 +403,7 @@ public class MetadataExtractor
         if (string.IsNullOrEmpty(text) || text.Length <= maxLength)
             return text;
         
-        return text.Substring(0, maxLength).Trim() + "...";
+        return text[..maxLength].Trim() + "...";
     }
 
     private (string title, string? description, string? imageUrl) GetFallbackMetadata(string url)
